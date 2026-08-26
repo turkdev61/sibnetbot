@@ -1,12 +1,12 @@
 import asyncio
 import logging
+from datetime import datetime
 import aiohttp
 from bs4 import BeautifulSoup
 
 # --- AYARLAR ---
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1490409043540316211/szNRJtsbxU2qGFMvd2tKRF2N1TjmM9lkVJHDFsEBktJUq75fb4ewqT0GAYKs8CTLUc9s"
 
-# Takip edilecek siteler ve kontrol aralıkları (saniye cinsinden)
 TARGETS = [
     {
         "name": "tayfunhasanov",
@@ -20,10 +20,9 @@ TARGETS = [
     },
 ]
 
-# Loglama Ayarları
 logging.basicConfig(
     format="[%(asctime)s] %(levelname)s: %(message)s",
-    datefmt="%H:%M:%S",
+    datefmt="%Y-%m-%d %H:%M:%S",
     level=logging.INFO,
 )
 
@@ -39,28 +38,23 @@ HEADERS = {
 }
 
 
-async def send_discord_notify(session, user_name, target_url, video_count):
+async def send_discord_log(session, log_text, has_new_video=False):
+    """Discord kanalına log mesajını ve gerekirse @everyone etiketini atar."""
+    content = log_text
+    if has_new_video:
+        content = f"@everyone 🚨 **YENİ VİDEO TESPİT EDİLDİ!**\n{log_text}"
+
     payload = {
-        "content": (
-            f"@everyone 🚨 **Sibnet'e Yeni Video Eklendi!**\n"
-            f"**{user_name}** kullanıcısının sayfasında yeni video tespit edildi! (Toplam: {video_count})\n"
-            f"🔗 **Sayfa Bağlantısı:** {target_url}"
-        ),
-        "username": "Sibnet Takipçisi",
+        "content": content,
+        "username": "Sibnet Log Botu",
         "allowed_mentions": {"parse": ["everyone"]},
     }
     try:
         async with session.post(DISCORD_WEBHOOK_URL, json=payload) as resp:
-            if resp.status == 204 or resp.status == 200:
-                logging.info(
-                    f"[{user_name}] Discord bildirimi (@everyone) başarıyla gönderildi!"
-                )
-            else:
-                logging.error(
-                    f"[{user_name}] Discord Webhook hatası: HTTP {resp.status}"
-                )
+            if resp.status not in (200, 204):
+                logging.error(f"[Discord Error] HTTP {resp.status}")
     except Exception as e:
-        logging.error(f"[{user_name}] Discord bildirim hatası: {e}")
+        logging.error(f"[Discord Error] {e}")
 
 
 async def monitor_target(target):
@@ -68,84 +62,75 @@ async def monitor_target(target):
     target_url = target["url"]
     interval = target["interval"]
 
-    logging.info(
-        f"[{user_name}] Takip başlatıldı. Kontrol sıklığı: {interval} saniye."
-    )
     last_video_count = None
 
     async with aiohttp.ClientSession(headers=HEADERS) as session:
         while True:
+            now_fmt1 = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            now_fmt2 = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+
             try:
                 async with session.get(
                     target_url, timeout=aiohttp.ClientTimeout(total=15)
                 ) as response:
                     status_code = response.status
-                    logging.info(
-                        f"[{user_name}] İstek atıldı | HTTP Status: {status_code}"
-                    )
 
                     if status_code == 200:
                         html = await response.text()
                         soup = BeautifulSoup(html, "html.parser")
 
-                        # Aranan div elementlerini bul
                         video_cells = soup.find_all(
-                            "div",
-                            class_="video_cell",
-                            attrs={
-                                "itemtype": "https://schema.org/VideoObject"
-                            },
+                            "div", class_=lambda c: c and "video_cell" in c
                         )
-
                         current_video_count = len(video_cells)
 
+                        # Birebir istenen log formatı
+                        log_msg = f"[{now_fmt1}] INFO: DETAY -> [{user_name}] | Tarih: {now_fmt2} | HTTP Status: {status_code} | Tespit Edilen Video Sayısı: {current_video_count}"
+
+                        logging.info(log_msg)
+
+                        # İlk çalıştırma
                         if last_video_count is None:
                             last_video_count = current_video_count
-                            logging.info(
-                                f"[{user_name}] İlk durum kaydedildi. Mevcut video sayısı: {current_video_count}"
+                            await send_discord_log(
+                                session, f"`{log_msg}`", has_new_video=False
                             )
 
+                        # Yeni video eklendiyse
                         elif current_video_count > last_video_count:
-                            logging.warning(
-                                f"[{user_name}] YENİ VİDEO TESPİT EDİLDİ! Önceki: {last_video_count} -> Yeni: {current_video_count}"
-                            )
-                            await send_discord_notify(
+                            await send_discord_log(
                                 session,
-                                user_name,
-                                target_url,
-                                current_video_count,
+                                f"`{log_msg}`\n🔗 **Sayfa:** {target_url}",
+                                has_new_video=True,
                             )
                             last_video_count = current_video_count
 
-                        elif current_video_count < last_video_count:
-                            logging.info(
-                                f"[{user_name}] Video sayısı azaldı/silindi. Güncel sayı: {current_video_count}"
-                            )
-                            last_video_count = current_video_count
-
+                        # Değişiklik yoksa veya azaldıysa (Normal log gönder)
                         else:
-                            logging.info(
-                                f"[{user_name}] Yeni bir değişiklik yok."
+                            await send_discord_log(
+                                session, f"`{log_msg}`", has_new_video=False
                             )
+                            last_video_count = current_video_count
 
-                    elif status_code == 403:
-                        logging.error(
-                            f"[{user_name}] 403 Forbidden! IP engeli veya bot koruması."
-                        )
-                    elif status_code == 429:
-                        logging.error(
-                            f"[{user_name}] 429 Too Many Requests! Çok fazla istek atıldı."
+                    else:
+                        error_log = f"[{now_fmt1}] ERROR: DETAY -> [{user_name}] | Tarih: {now_fmt2} | HTTP Status: {status_code}"
+                        logging.error(error_log)
+                        await send_discord_log(
+                            session, f"`{error_log}`", has_new_video=False
                         )
 
             except Exception as e:
-                logging.error(f"[{user_name}] İstek sırasında hata: {e}")
+                fail_log = f"[{now_fmt1}] ERROR: DETAY -> [{user_name}] | Tarih: {now_fmt2} | İstek Hatası: {e}"
+                logging.error(fail_log)
+                await send_discord_log(
+                    session, f"`{fail_log}`", has_new_video=False
+                )
 
             await asyncio.sleep(interval)
 
 
 async def main():
     logging.info("Tüm Sibnet Takip Görevleri Başlatılıyor...")
-    # İki takibi de aynı anda paralel çalıştırır
     tasks = [monitor_target(target) for target in TARGETS]
     await asyncio.gather(*tasks)
 
